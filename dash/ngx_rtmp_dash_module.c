@@ -53,6 +53,7 @@ typedef struct {
     ngx_str_t                           playlist_bak;
     ngx_str_t                           manifest_playlist;
     ngx_str_t                           manifest_playlist_bak;
+    ngx_str_t                           manifest_playlist_audio_bak;
     ngx_str_t                           representation;
     ngx_str_t                           name;
     ngx_str_t                           stream;
@@ -89,6 +90,7 @@ typedef struct {
     ngx_flag_t                          nested;
     ngx_array_t                        *representation;
     ngx_str_t                           path;
+    ngx_str_t                           base_url;
     ngx_uint_t                          winfrags;
     ngx_flag_t                          cleanup;
     ngx_path_t                         *slot;
@@ -146,6 +148,13 @@ static ngx_command_t ngx_rtmp_dash_commands[] = {
       offsetof(ngx_rtmp_dash_app_conf_t, representation),
       NULL
     },
+
+    { ngx_string("dash_base_url"),
+      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_RTMP_APP_CONF_OFFSET,
+      offsetof(ngx_rtmp_dash_app_conf_t, base_url),
+      NULL },
 
     ngx_null_command
 };
@@ -227,26 +236,31 @@ ngx_rtmp_dash_rename_file(u_char *src, u_char *dst)
 
 static ngx_int_t
 ngx_rtmp_dash_write_manifest_playlist(ngx_rtmp_session_t *s,
-    u_char *start_time, u_char *end_time)
+    u_char *start_time, u_char *end_time, u_char *base_url)
 {
     // not sure if this will work in the long run, because we need
     // some method of pulling information across all live streams...
 
     static u_char               buffer[NGX_RTMP_DASH_BUFSIZE];
-    static u_char               rep_buffer[NGX_RTMP_DASH_BUFSIZE];
+    static u_char               read_buffer[NGX_RTMP_DASH_BUFSIZE];
+    static u_char               audio_read_buffer[NGX_RTMP_DASH_BUFSIZE];
     static u_char               rep_path[NGX_MAX_PATH + 1];
     ngx_uint_t                  i;
     ssize_t                     rc;
-    ngx_fd_t                    manifest_fd, rep_fd;
+    ngx_fd_t                    manifest_fd, audio_fd, rep_fd;
+    ngx_fd_t                    *current_fd;
     FILE                        *rep_file;
-    u_char                      *p, *last, *rep_p, *rep_last;
+    FILE                        *audio_file;
+    u_char                      *p, *last;
+    u_char                      *rep_p, *rep_last;
     ngx_str_t                   *rep_name, app_name;
     ngx_rtmp_dash_ctx_t         *ctx;
     ngx_rtmp_dash_app_conf_t    *dacf;
     u_char                      *suffix;
+    char                        *read_result;
     u_char                      nested_suffix[] = "/index.mpd";
     u_char                      unnested_suffix[] = ".mpd";
-    unsigned int                in_child_set_block = 0;
+    unsigned int                in_block = 0;
 
     dacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_dash_module);
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_dash_module);
@@ -269,6 +283,18 @@ ngx_rtmp_dash_write_manifest_playlist(ngx_rtmp_session_t *s,
         return NGX_ERROR;
     }
 
+    // setting to video initially...
+    current_fd = &manifest_fd;
+
+    audio_fd = ngx_open_file(ctx->manifest_playlist_audio_bak.data,
+            NGX_FILE_RDWR, NGX_FILE_TRUNCATE, NGX_FILE_DEFAULT_ACCESS);
+
+    if (audio_fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
+                      "dash: opening master playlist failed.");
+        return NGX_ERROR;
+    }
+
     // right now, building all of this up in the current process. this
     // could get really slow / dangerous as the number of streams increases
     // file contention...
@@ -281,16 +307,15 @@ ngx_rtmp_dash_write_manifest_playlist(ngx_rtmp_session_t *s,
                      (ngx_uint_t) (dacf->fraglen / 500));
 
     p = ngx_slprintf(p, last, NGX_RTMP_DASH_PERIOD_HEADER);
+    p = ngx_slprintf(p, last, NGX_RTMP_DASH_ADAPTATION_SET_VIDEO, base_url);
     rc = ngx_write_fd(manifest_fd, buffer, p - buffer);
 
     rep_name = dacf->representation->elts;
 
     for (i = 0; i < dacf->representation->nelts; i++, rep_name++) {
 
-        p = buffer;
-        in_child_set_block = 0;
-
         // reading other representation contents
+        in_block = 0;
 
         rep_p = rep_path;
         rep_last = rep_path + sizeof(rep_path);
@@ -315,64 +340,113 @@ ngx_rtmp_dash_write_manifest_playlist(ngx_rtmp_session_t *s,
 
         rep_file = fdopen(rep_fd, "r");
 
-
         // buffered read of child manifest...
-        rep_p = rep_buffer;
+        while ((read_result = fgets((char *)read_buffer, sizeof(read_buffer),
+                rep_file)) != NULL) {
 
-        while (fgets((char *)rep_buffer, sizeof(rep_buffer),
-                rep_file) != NULL) {
+            if (read_buffer[0] == '\0') {
+                break;
+            }
 
             // we dump everything from inside period elements, because
             // currently we hardcode adaptation sets to the same group
             // numbers for audio and video blocks. By the spec, this should
             // work, although client testing will prove out the theory...
 
-            if (!in_child_set_block) {
-                if (strncmp((const char *)rep_buffer,
-                        NGX_RTMP_DASH_PERIOD_HEADER,
-                        strlen(NGX_RTMP_DASH_PERIOD_HEADER)) == 0) {
-                    in_child_set_block = 1;
-                    ngx_write_fd(manifest_fd, "<!-- START CHILD BLOCK -->\n",
-                        strlen("<!-- START CHILD BLOCK -->\n"));
+            if (!in_block) {
+                if (strncmp((const char *)read_buffer,
+                        NGX_RTMP_DASH_CHILD_VIDEO_HEADER,
+                        strlen(NGX_RTMP_DASH_CHILD_VIDEO_HEADER)) == 0) {
+                    in_block = 1;
+                    current_fd = &manifest_fd;
+                } else if (strncmp((const char *)read_buffer,
+                        NGX_RTMP_DASH_CHILD_AUDIO_HEADER,
+                        strlen(NGX_RTMP_DASH_CHILD_AUDIO_HEADER)) == 0) {
+                    in_block = 1;
+                    current_fd = &audio_fd;
                 }
                 continue;
-            } else if (strncmp((const char *)rep_buffer,
-                    NGX_RTMP_DASH_PERIOD_FOOTER,
-                    strlen(NGX_RTMP_DASH_PERIOD_FOOTER)) == 0) {
-                in_child_set_block = 0;
-                    ngx_write_fd(manifest_fd, "<!-- END CHILD BLOCK -->\n",
-                        strlen("<!-- END CHILD BLOCK -->\n"));
-                break;
+            } else {
+                if (strncmp((const char *)read_buffer,
+                        NGX_RTMP_DASH_CHILD_VIDEO_FOOTER,
+                        strlen(NGX_RTMP_DASH_CHILD_VIDEO_FOOTER)) == 0) {
+
+                    in_block = 0;
+                    continue;
+                } else if (strncmp((const char *)read_buffer,
+                        NGX_RTMP_DASH_CHILD_AUDIO_FOOTER,
+                        strlen(NGX_RTMP_DASH_CHILD_AUDIO_FOOTER)) == 0) {
+
+                    in_block = 0;
+                    current_fd = &manifest_fd;
+                    break;
+                }
             }
 
-            rc = ngx_write_fd(manifest_fd, rep_buffer,
-                strnlen((char *)rep_buffer, sizeof(rep_buffer)));
+            rc = ngx_write_fd(*current_fd, read_buffer,
+                strnlen((char *)read_buffer, sizeof(read_buffer)));
 
             if (rc == NGX_ERROR) {
                 ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
                               "dash: writing rep to master playlist failed");
                 ngx_close_file(rep_fd);
                 ngx_close_file(manifest_fd);
+                ngx_close_file(audio_fd);
                 return NGX_ERROR;
             }
         }
 
         ngx_close_file(rep_fd);
+        if (read_result == NULL) {
+            ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
+                          "dash: reading audio for master playlist failed");
+            ngx_delete_file(ctx->manifest_playlist_audio_bak.data);
+            ngx_close_file(manifest_fd);
+            ngx_close_file(audio_fd);
+            return NGX_ERROR;
+        }
 
     }
 
+    // closing out video section and opening audio section
+    p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_ADAPTATION_SET_FOOTER);
+    p = ngx_slprintf(p, last, NGX_RTMP_DASH_ADAPTATION_SET_AUDIO,
+                     base_url);
+    rc = ngx_write_fd(manifest_fd, buffer, p - buffer);
+
+    // copying over contents from audio file...
+    lseek(audio_fd, 0, SEEK_SET);
+    audio_file = fdopen(audio_fd, "r");
+
+    while ((fgets((char *)audio_read_buffer,
+            sizeof(audio_read_buffer), audio_file)) != NULL) {
+        if (audio_read_buffer[0] == '\0') {
+            break;
+        }
+        rc = ngx_write_fd(manifest_fd, audio_read_buffer,
+            strnlen((char *)audio_read_buffer, sizeof(audio_read_buffer)));
+    }
+
+    // closing out audio file and removing it...
+    ngx_close_file(audio_fd);
+    ngx_delete_file(ctx->manifest_playlist_audio_bak.data);
+
+    // closing out manifest
+    p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_ADAPTATION_SET_FOOTER);
     p = ngx_slprintf(p, last, NGX_RTMP_DASH_PERIOD_FOOTER);
     p = ngx_slprintf(p, last, NGX_RTMP_DASH_MANIFEST_FOOTER);
     rc = ngx_write_fd(manifest_fd, buffer, p - buffer);
 
     ngx_close_file(manifest_fd);
 
+    // checking for errors...
     if (rc == NGX_ERROR) {
         ngx_log_error(NGX_LOG_ERR, s->connection->log, ngx_errno,
                       "dash: writing to master playlist failed");
         return NGX_ERROR;
     }
 
+    // renaming to final location
     if (ngx_rtmp_dash_rename_file(ctx->manifest_playlist_bak.data,
             ctx->manifest_playlist.data)
         == NGX_FILE_ERROR)
@@ -402,6 +476,7 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
     ngx_rtmp_dash_app_conf_t  *dacf;
 
     static u_char              buffer[NGX_RTMP_DASH_BUFSIZE];
+    static u_char              base_url[NGX_MAX_PATH + 1];
     static u_char              start_time[sizeof("1970-09-28T12:00:00+06:00")];
     static u_char              end_time[sizeof("1970-09-28T12:00:00+06:00")];
 
@@ -426,6 +501,12 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
         return NGX_ERROR;
     }
 
+    if (dacf->base_url.len > 0) {
+        ngx_slprintf(base_url, base_url + sizeof(base_url),
+            NGX_RTMP_DASH_BASE_URL_ATTRIBUTE, &dacf->base_url);
+    } else {
+        *base_url = '\0';
+    }
 
     ngx_libc_localtime(ctx->start_time.sec +
                        ngx_rtmp_dash_get_frag(s, 0)->timestamp / 1000, &tm);
@@ -469,11 +550,9 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
     sep = (dacf->nested ? "" : "-");
 
     if (ctx->has_video) {
-        // iterate over video representations later...
         p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_ADAPTATION_SET_VIDEO,
-                         codec_ctx->width,
-                         codec_ctx->height,
-                         codec_ctx->frame_rate);
+                         base_url);
+        p = ngx_slprintf(p, last, NGX_RTMP_DASH_CHILD_VIDEO_HEADER);
         p = ngx_slprintf(p, last, NGX_RTMP_DASH_REPRESENTATION_VIDEO,
                          &ctx->name,
                          codec_ctx->avc_profile,
@@ -493,14 +572,16 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
         }
 
         p = ngx_slprintf(p, last, NGX_RTMP_DASH_REPRESENTATION_FOOTER);
+        p = ngx_slprintf(p, last, NGX_RTMP_DASH_CHILD_VIDEO_FOOTER);
         p = ngx_slprintf(p, last, NGX_RTMP_DASH_ADAPTATION_SET_FOOTER);
 
         n = ngx_write_fd(fd, buffer, p - buffer);
     }
 
     if (ctx->has_audio) {
-        // iterate over audio representations later...
-        p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_ADAPTATION_SET_AUDIO);
+        p = ngx_slprintf(buffer, last, NGX_RTMP_DASH_ADAPTATION_SET_AUDIO,
+                         base_url);
+        p = ngx_slprintf(p, last, NGX_RTMP_DASH_CHILD_AUDIO_HEADER);
         p = ngx_slprintf(p, last, NGX_RTMP_DASH_REPRESENTATION_AUDIO,
                          &ctx->name,
                          codec_ctx->audio_codec_id == NGX_RTMP_AUDIO_AAC ?
@@ -517,6 +598,7 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
         }
 
         p = ngx_slprintf(p, last, NGX_RTMP_DASH_REPRESENTATION_FOOTER);
+        p = ngx_slprintf(p, last, NGX_RTMP_DASH_CHILD_AUDIO_FOOTER);
         p = ngx_slprintf(p, last, NGX_RTMP_DASH_ADAPTATION_SET_FOOTER);
 
         n = ngx_write_fd(fd, buffer, p - buffer);
@@ -546,7 +628,7 @@ ngx_rtmp_dash_write_playlist(ngx_rtmp_session_t *s)
 
     if (dacf->representation->nelts > 0) {
         return ngx_rtmp_dash_write_manifest_playlist(
-            s, start_time, end_time);
+            s, start_time, end_time, base_url);
     }
 
     return NGX_OK;
@@ -1029,6 +1111,7 @@ ngx_rtmp_dash_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
 
     if (dacf->representation->nelts > 0) {
         rep = dacf->representation->elts;
+        ctx->manifest_playlist.len = 0;
         for (n = 0; n < dacf->representation->nelts; n++, rep++) {
             if (ctx->name.len > rep->len &&
                 ngx_memcmp(rep->data,
@@ -1048,6 +1131,9 @@ ngx_rtmp_dash_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
                 *pp = 0;
                 break;
             }
+        }
+        if (ctx->manifest_playlist.len == 0) {
+            return NGX_ERROR;
         }
     }
 
@@ -1074,6 +1160,8 @@ ngx_rtmp_dash_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
     *p = 0;
 
     if (dacf->representation->nelts > 0) {
+
+        // building backup manifest playlist for multiple versions
         ctx->manifest_playlist_bak.data = ngx_palloc(s->connection->pool,
                 ctx->manifest_playlist.len + sizeof(".bak"));
         p = ngx_cpymem(ctx->manifest_playlist_bak.data,
@@ -1081,6 +1169,19 @@ ngx_rtmp_dash_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
         p = ngx_cpymem(p, ".bak", sizeof(".bak") - 1);
 
         ctx->manifest_playlist_bak.len = p - ctx->manifest_playlist_bak.data;
+
+        *p = 0;
+
+        // building audio backup manifest playlist for multiple versions
+        ctx->manifest_playlist_audio_bak.data = ngx_palloc(s->connection->pool,
+                ctx->manifest_playlist_bak.len + sizeof(".audio"));
+        p = ngx_cpymem(ctx->manifest_playlist_audio_bak.data,
+                ctx->manifest_playlist_bak.data,
+                ctx->manifest_playlist_bak.len);
+        p = ngx_cpymem(p, ".audio", sizeof(".audio") - 1);
+
+        ctx->manifest_playlist_audio_bak.len =
+            p - ctx->manifest_playlist_audio_bak.data;
 
         *p = 0;
     }

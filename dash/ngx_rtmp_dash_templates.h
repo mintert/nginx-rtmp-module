@@ -22,7 +22,7 @@
 
 #define NGX_RTMP_DASH_ADAPTATION_SET_VIDEO                                     \
     "    <AdaptationSet\n"                                                     \
-    "        group=\"1\"\n"                                                    \
+    "        id=\"1\"\n%s"                                                     \
     "        contentType=\"video\"\n"                                          \
     "        segmentAlignment=\"true\">\n"
 
@@ -46,7 +46,7 @@
 
 #define NGX_RTMP_DASH_ADAPTATION_SET_AUDIO                                     \
     "    <AdaptationSet\n"                                                     \
-    "        group=\"2\"\n"                                                    \
+    "        id=\"2\"\n%s"                                                     \
     "        segmentAlignment=\"true\">\n"                                     \
     "      <AudioChannelConfiguration\n"                                       \
     "          schemeIdUri=\"urn:mpeg:dash:"                                   \
@@ -87,5 +87,23 @@
 
 
 #define NGX_RTMP_DASH_MANIFEST_PATH "%V/%V%V%s"
+
+#define NGX_RTMP_DASH_BASE_URL_ATTRIBUTE                                       \
+    "        BaseURL=\"%V\"\n"
+
+// for splicing files into master manifest file...
+
+#define NGX_RTMP_DASH_CHILD_VIDEO_HEADER                                       \
+    "<!-- REPRESENTATION VIDEO -->\n"
+
+#define NGX_RTMP_DASH_CHILD_AUDIO_HEADER                                       \
+    "<!-- REPRESENTATION AUDIO -->\n"
+
+#define NGX_RTMP_DASH_CHILD_VIDEO_FOOTER                                       \
+    "<!-- END REPRESENTATION VIDEO -->\n"
+
+#define NGX_RTMP_DASH_CHILD_AUDIO_FOOTER                                       \
+    "<!-- END REPRESENTATION AUDIO -->\n"
+
 
 #endif
