@@ -29,9 +29,14 @@ static ngx_int_t ngx_rtmp_init_event_handlers(ngx_conf_t *cf,
 static char * ngx_rtmp_merge_applications(ngx_conf_t *cf,
         ngx_array_t *applications, void **app_conf, ngx_rtmp_module_t *module,
         ngx_uint_t ctx_index);
+static ngx_int_t ngx_rtmp_init_process(ngx_cycle_t *cycle);
 
 
+#if (nginx_version >= 1007005)
+ngx_thread_volatile ngx_queue_t     ngx_rtmp_init_queue;
+#else
 ngx_thread_volatile ngx_event_t    *ngx_rtmp_init_queue;
+#endif
 
 
 ngx_uint_t  ngx_rtmp_max_module;
@@ -64,7 +69,7 @@ ngx_module_t  ngx_rtmp_module = {
     NGX_CORE_MODULE,                       /* module type */
     NULL,                                  /* init master */
     NULL,                                  /* init module */
-    NULL,                                  /* init process */
+    ngx_rtmp_init_process,                 /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
     NULL,                                  /* exit process */
@@ -544,6 +549,7 @@ found:
     addr->bind = listen->bind;
     addr->wildcard = listen->wildcard;
     addr->so_keepalive = listen->so_keepalive;
+    addr->proxy_protocol = listen->proxy_protocol;
 #if (NGX_HAVE_KEEPALIVE_TUNABLE)
     addr->tcp_keepidle = listen->tcp_keepidle;
     addr->tcp_keepintvl = listen->tcp_keepintvl;
@@ -702,6 +708,7 @@ ngx_rtmp_add_addrs(ngx_conf_t *cf, ngx_rtmp_port_t *mport,
 
         addrs[i].conf.addr_text.len = len;
         addrs[i].conf.addr_text.data = p;
+        addrs[i].conf.proxy_protocol = addr->proxy_protocol;
     }
 
     return NGX_OK;
@@ -751,6 +758,7 @@ ngx_rtmp_add_addrs6(ngx_conf_t *cf, ngx_rtmp_port_t *mport,
 
         addrs6[i].conf.addr_text.len = len;
         addrs6[i].conf.addr_text.data = p;
+        addrs6[i].conf.proxy_protocol = addr->proxy_protocol;
     }
 
     return NGX_OK;
@@ -823,4 +831,14 @@ ngx_rtmp_rmemcpy(void *dst, const void* src, size_t n)
     }
 
     return dst;
+}
+
+
+static ngx_int_t
+ngx_rtmp_init_process(ngx_cycle_t *cycle)
+{
+#if (nginx_version >= 1007005)
+    ngx_queue_init(&ngx_rtmp_init_queue);
+#endif
+    return NGX_OK;
 }

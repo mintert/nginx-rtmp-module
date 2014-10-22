@@ -12,6 +12,7 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 #include <ngx_event_connect.h>
+#include <nginx.h>
 
 #include "ngx_rtmp_amf.h"
 #include "ngx_rtmp_bandwidth.h"
@@ -43,6 +44,7 @@ typedef struct {
     unsigned                ipv6only:2;
 #endif
     unsigned                so_keepalive:2;
+    unsigned                proxy_protocol:1;
 #if (NGX_HAVE_KEEPALIVE_TUNABLE)
     int                     tcp_keepidle;
     int                     tcp_keepintvl;
@@ -54,6 +56,7 @@ typedef struct {
 typedef struct {
     ngx_rtmp_conf_ctx_t    *ctx;
     ngx_str_t               addr_text;
+    unsigned                proxy_protocol:1;
 } ngx_rtmp_addr_conf_t;
 
 typedef struct {
@@ -97,6 +100,7 @@ typedef struct {
     unsigned                ipv6only:2;
 #endif
     unsigned                so_keepalive:2;
+    unsigned                proxy_protocol:1;
 #if (NGX_HAVE_KEEPALIVE_TUNABLE)
     int                     tcp_keepidle;
     int                     tcp_keepintvl;
@@ -195,7 +199,11 @@ typedef struct {
     ngx_str_t              *addr_text;
     int                     connected;
 
+#if (nginx_version >= 1007005)
+    ngx_queue_t             posted_dry_events;
+#else
     ngx_event_t            *posted_dry_events;
+#endif
 
     /* client buffer time in msec */
     uint32_t                buflen;
@@ -599,7 +607,11 @@ extern ngx_rtmp_bandwidth_t                 ngx_rtmp_bw_in;
 
 
 extern ngx_uint_t                           ngx_rtmp_naccepted;
+#if (nginx_version >= 1007005)
+extern ngx_thread_volatile ngx_queue_t      ngx_rtmp_init_queue;
+#else
 extern ngx_thread_volatile ngx_event_t     *ngx_rtmp_init_queue;
+#endif
 
 extern ngx_uint_t                           ngx_rtmp_max_module;
 extern ngx_module_t                         ngx_rtmp_core_module;

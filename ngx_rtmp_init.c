@@ -7,6 +7,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include "ngx_rtmp.h"
+#include "ngx_rtmp_proxy_protocol.h"
 
 
 static void ngx_rtmp_close_connection(ngx_connection_t *c);
@@ -130,7 +131,12 @@ ngx_rtmp_init_connection(ngx_connection_t *c)
 
     s->auto_pushed = unix_socket;
 
-    ngx_rtmp_handshake(s);
+    if (addr_conf->proxy_protocol) {
+        ngx_rtmp_proxy_protocol(s);
+
+    } else {
+        ngx_rtmp_handshake(s);
+    }
 }
 
 
@@ -190,6 +196,10 @@ ngx_rtmp_init_session(ngx_connection_t *c, ngx_rtmp_addr_conf_t *addr_conf)
         ngx_rtmp_close_connection(c);
         return NULL;
     }
+
+#if (nginx_version >= 1007005)
+    ngx_queue_init(&s->posted_dry_events);
+#endif
 
     s->epoch = ngx_current_msec;
     s->timeout = cscf->timeout;
